@@ -1,4 +1,5 @@
 .sconsign.dblite
 *.o
 *.swp
+*~
 pdfpres

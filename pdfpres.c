@@ -54,6 +54,7 @@ static GtkWidget *mainStatusbar = NULL;
 static PopplerDocument *doc = NULL;
 
 int doc_n_pages = 0;
+int doc_last_page = 0;
 int doc_page = 0;
 static int doc_page_mark = 0;
 static int doc_page_beamer = 0;
@@ -78,9 +79,10 @@ static GtkToolItem *saveButton = NULL,
 				   *resetButton = NULL;
 static GtkWidget *notePad = NULL, *notePadFrame = NULL;
 static GtkWidget *timeElapsedLabel = NULL;
+static GtkWidget *curPageLabel = NULL;
 GtkTextBuffer *noteBuffer = NULL;
 
-static GdkColor col_current, col_marked, col_dim;
+static GdkRGBA col_current, col_marked, col_dim;
 
 
 static void onSaveClicked(GtkWidget *widget, gpointer data);
@@ -146,30 +148,21 @@ static void refreshFrames(void)
 		if (pp->isBeamer == FALSE)
 		{
 			/* reset background color */
-			gtk_widget_modify_bg(gtk_widget_get_parent(pp->frame), GTK_STATE_NORMAL,
-					NULL);
+			gtk_widget_override_background_color(gtk_widget_get_parent(pp->frame), 
+			    GTK_STATE_NORMAL, NULL);
 
 			/* lock mode: highlight the saved/current page */
 			if (beamer_active == FALSE)
 			{
 				if (doc_page + pp->offset == doc_page_mark)
 				{
-					gtk_widget_modify_bg(gtk_widget_get_parent(pp->frame),
+					gtk_widget_override_background_color(gtk_widget_get_parent(pp->frame),
 							GTK_STATE_NORMAL, &col_marked);
 				}
 				else if (pp->offset == 0)
 				{
-					gtk_widget_modify_bg(gtk_widget_get_parent(pp->frame),
+					gtk_widget_override_background_color(gtk_widget_get_parent(pp->frame),
 							GTK_STATE_NORMAL, &col_dim);
-				}
-			}
-			/* normal mode: highlight the "current" frame */
-			else
-			{
-				if (pp->offset == 0)
-				{
-					gtk_widget_modify_bg(gtk_widget_get_parent(pp->frame),
-							GTK_STATE_NORMAL, &col_current);
 				}
 			}
 		}
@@ -824,7 +817,24 @@ static int executeJump(void)
 	/* Jump? */
 	if (target_page >= 0)
 	{
-		target_page--;
+		
+		int label = 0;
+		int runs = 0;
+		int page_number = target_page-1;
+		while (runs < doc_n_pages && page_number >= 0 && page_number < doc_n_pages) {
+		    PopplerPage *page = poppler_document_get_page(doc, page_number);
+		    label = atoi(poppler_page_get_label(page));
+		    if (label == target_page)
+		        break;
+		    if (label < target_page)
+		        page_number++;
+		    else if (label > target_page)
+		        page_number--;
+		    runs++;
+		    g_object_unref(G_OBJECT(page));
+		}
+		
+		target_page = page_number;
 
 		/* Restrict to valid range. */
 		if (target_page >= 0 && target_page < doc_n_pages)
@@ -1116,6 +1126,13 @@ static gboolean onCanvasDraw(GtkWidget *widget, cairo_t *cr,
 	/* Get the page and it's size from the document. */
 	page = poppler_document_get_page(doc, mypage_i);
 	poppler_page_get_size(page, &popwidth, &popheight);
+	
+	/* Set page number */
+	if (pp->isBeamer)
+	{
+	    gtk_label_set_text(GTK_LABEL(curPageLabel), 
+	        g_strdup_printf("%s/%d", poppler_page_get_label(page), doc_last_page));
+	}
 
 	/* Select fit mode. */
 	page_ratio = popwidth / popheight;
@@ -1154,23 +1171,22 @@ static gboolean onCanvasDraw(GtkWidget *widget, cairo_t *cr,
 			break;
 	}
 
-	/* A black background. Push and pop cairo contexts, so we have a
+	/* A black background on beamer frame. Push and pop cairo contexts, so we have a
 	 * clean state afterwards. */
-	cairo_save(cr);
-	cairo_set_source_rgb(cr, 0, 0, 0);
-	cairo_rectangle(cr, 0, 0, pp->width, pp->height);
-	cairo_fill(cr);
-	cairo_restore(cr);
+	if (pp->isBeamer) {
+	    cairo_save(cr);
+	    cairo_set_source_rgb(cr, 0, 0, 0);
+	    cairo_rectangle(cr, 0, 0, pp->width, pp->height);
+	    cairo_fill(cr);
+	    cairo_restore(cr);
+	    
+	    /* center page on beamer */
+	    cairo_translate(cr, tx, ty);
+	} else {
+	    cairo_translate(cr, tx, 0);
+	}
 
-	/* A white background, i.e. "paper color". */
-	cairo_save(cr);
-	cairo_set_source_rgb(cr, 1, 1, 1);
-	cairo_rectangle(cr, tx, ty, w, h);
-	cairo_fill(cr);
-	cairo_restore(cr);
-
-	/* Render the page centered and scaled. */
-	cairo_translate(cr, tx, ty);
+	/* Render the page */
 	cairo_scale(cr, scale, scale);
 	poppler_page_render(page, cr);
 
@@ -1190,18 +1206,23 @@ static void usage(char *exe)
 
 static void initGUI(int numframes, gchar *notefile)
 {
+	g_object_set(gtk_settings_get_default(),"gtk-application-prefer-dark-theme", TRUE, NULL);
+	
 	int i = 0, transIndex = 0;
 	GtkWidget *timeBox = NULL,
+	          *pageBox = NULL,
 			  *notePadBox = NULL,
 			  *notePadScroll = NULL,
 			  *table = NULL;
 	GtkWidget *canvas = NULL,
 			  *frame = NULL,
 			  *evbox = NULL,
+			  *pageevbox = NULL,
 			  *outerevbox = NULL,
-			  *timeFrame = NULL;
+			  *timeFrame = NULL,
+			  *pageFrame = NULL;
 	GtkWidget *mainVBox = NULL;
-	GdkColor black;
+	GdkRGBA black;
 
 	GtkWidget *toolbar = NULL, *timeToolbar = NULL;
 	GtkToolItem *openButton = NULL,
@@ -1214,13 +1235,13 @@ static void initGUI(int numframes, gchar *notefile)
 	struct viewport *thisport = NULL;
 
 	/* init colors */
-	if (gdk_color_parse("#000000", &black) != TRUE)
+	if (gdk_rgba_parse(&black,"#000000") != TRUE)
 		fprintf(stderr, "Could not resolve color \"black\".\n");
-	if (gdk_color_parse("#BBFFBB", &col_current) != TRUE)
+	if (gdk_rgba_parse(&col_current,"#BBFFBB") != TRUE)
 		fprintf(stderr, "Could not resolve color \"col_current\".\n");
-	if (gdk_color_parse("#FFBBBB", &col_marked) != TRUE)
+	if (gdk_rgba_parse(&col_marked,"#990000") != TRUE)
 		fprintf(stderr, "Could not resolve color \"col_marked\".\n");
-	if (gdk_color_parse("#BBBBBB", &col_dim) != TRUE)
+	if (gdk_rgba_parse(&col_dim,"#999999") != TRUE)
 		fprintf(stderr, "Could not resolve color \"col_dim\".\n");
 
 
@@ -1258,7 +1279,7 @@ static void initGUI(int numframes, gchar *notefile)
 	gtk_container_set_border_width(GTK_CONTAINER(win_preview), 0);
 	gtk_container_set_border_width(GTK_CONTAINER(win_beamer), 0);
 
-	gtk_widget_modify_bg(win_beamer, GTK_STATE_NORMAL, &black);
+	gtk_widget_override_background_color(win_beamer, GTK_STATE_NORMAL, &black);
 
 	/* That little "resize grip" is a no-go for our beamer window. */
 	gtk_window_set_has_resize_grip(GTK_WINDOW(win_beamer), FALSE);
@@ -1292,10 +1313,12 @@ static void initGUI(int numframes, gchar *notefile)
 	g_signal_connect(G_OBJECT(timeFontSelectButton), "clicked",
 			G_CALLBACK(onTimerFontSelectClick), NULL);
 
-	/* setting text size for time label */
+	/* setting text size for time/page label */
 	timeElapsedLabel = gtk_label_new(NULL);
+	curPageLabel = gtk_label_new(NULL);
 	font_desc = pango_font_description_from_string(prefs.font_timer);
 	gtk_widget_modify_font(GTK_WIDGET(timeElapsedLabel), font_desc);
+	gtk_widget_modify_font(GTK_WIDGET(curPageLabel), font_desc);
 	pango_font_description_free(font_desc);
 	if (prefs.timer_is_clock)
 	{
@@ -1305,6 +1328,7 @@ static void initGUI(int numframes, gchar *notefile)
 	{
 		gtk_label_set_text(GTK_LABEL(timeElapsedLabel), "00:00");
 	}
+	gtk_label_set_text(GTK_LABEL(curPageLabel), "0/0");
 
 	/* Add timer label to another event box so we can set a nice border.
 	 */
@@ -1312,12 +1336,18 @@ static void initGUI(int numframes, gchar *notefile)
 	gtk_container_add(GTK_CONTAINER(evbox), timeElapsedLabel);
 	gtk_container_set_border_width(GTK_CONTAINER(evbox), 10);
 
+    pageevbox = gtk_event_box_new();
+	gtk_container_add(GTK_CONTAINER(pageevbox), curPageLabel);
+	gtk_container_set_border_width(GTK_CONTAINER(pageevbox), 10);
+
 	/* create timer */
 	timeBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
-	gtk_box_pack_start(GTK_BOX(timeBox), evbox,
-			TRUE, TRUE, 5);
-	gtk_box_pack_start(GTK_BOX(timeBox), timeToolbar,
-			FALSE, FALSE, 5);
+	gtk_box_pack_start(GTK_BOX(timeBox), evbox, FALSE, FALSE, 5);
+    gtk_box_pack_start(GTK_BOX(timeBox), timeToolbar, FALSE, FALSE, 5);
+			
+    pageBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 5);
+	gtk_box_pack_start(GTK_BOX(pageBox), pageevbox, FALSE, FALSE, 5);
+
 
 	if (prefs.timer_is_clock)
 	{
@@ -1328,6 +1358,9 @@ static void initGUI(int numframes, gchar *notefile)
 		timeFrame = gtk_frame_new("Timer");
 	}
 	gtk_container_add(GTK_CONTAINER(timeFrame), timeBox);
+	
+	pageFrame = gtk_frame_new("Page");
+	gtk_container_add(GTK_CONTAINER(pageFrame), pageBox);
 
 	/* create note pad inside a scrolled window */
 	notePadBox = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
@@ -1420,7 +1453,7 @@ static void initGUI(int numframes, gchar *notefile)
 	gtk_container_add(GTK_CONTAINER(notePadFrame), notePadBox);
 
 	/* init containers for "preview" */
-	table = gtk_table_new(numframes, numframes + 1, TRUE);
+	table = gtk_table_new(7, 10, TRUE);
 	gtk_table_set_col_spacings(GTK_TABLE(table), 5);
 	gtk_container_set_border_width(GTK_CONTAINER(table), 10);
 
@@ -1439,7 +1472,7 @@ static void initGUI(int numframes, gchar *notefile)
 		/* create a new drawing area - the pdf will be rendered in
 		 * there */
 		canvas = gtk_drawing_area_new();
-
+        
 		/* add widgets to their parents. the canvas is placed in an
 		 * eventbox, the box's size_allocate signal will be handled. so,
 		 * we know the exact width/height we can render into. (placing
@@ -1457,43 +1490,24 @@ static void initGUI(int numframes, gchar *notefile)
 
 		if (i == 0)
 		{
-			gtk_table_attach_defaults(GTK_TABLE(table), notePadFrame,
-					0, 1, 0, numframes - 1);
-			gtk_table_attach_defaults(GTK_TABLE(table), outerevbox,
-					0, 1, numframes - 1, numframes);
+			//gtk_table_attach_defaults(GTK_TABLE(table), notePadFrame,
+			//		0, 1, 0, 2);
+			//gtk_table_attach_defaults(GTK_TABLE(table), outerevbox,
+			//		3, 4, 1, 2);
 		}
 		else
 		{
 			if (i == numframes - 1)
 			{
-				gtk_table_attach_defaults(GTK_TABLE(table), outerevbox,
-						numframes, numframes + 1,
-						0, 1);
-				gtk_table_attach_defaults(GTK_TABLE(table), timeFrame,
-						numframes, numframes + 1,
-						numframes - 1, numframes);
+				gtk_table_attach_defaults(GTK_TABLE(table), outerevbox, 6, 10, 0, 5);
+				gtk_table_attach_defaults(GTK_TABLE(table), timeFrame,  6, 8, 5, 7);
+				gtk_table_attach_defaults(GTK_TABLE(table), pageFrame,  8, 10, 5, 7);
 			}
 			else
 			{
 				if (i == (int)(numframes / 2))
 				{
-					gtk_table_attach_defaults(GTK_TABLE(table),
-							outerevbox, i, i + 2, 0, numframes);
-				}
-				else
-				{
-					if (i < (int)(numframes / 2))
-					{
-						gtk_table_attach_defaults(GTK_TABLE(table),
-								outerevbox, i, i + 1,
-								numframes - i - 1, numframes - i);
-					}
-					else
-					{
-						gtk_table_attach_defaults(GTK_TABLE(table),
-								outerevbox, i + 1, i + 2,
-								numframes - i - 1, numframes - i);
-					}
+					gtk_table_attach_defaults(GTK_TABLE(table), outerevbox, 0, 6, 0, 7);
 				}
 			}
 		}
@@ -1574,8 +1588,11 @@ static void initGUI(int numframes, gchar *notefile)
 	/* Set default sizes for both windows. (Note: If the widgets don't
 	 * fit into that space, the windows will be larger. Also, they are
 	 * allowed to get shrinked by the user.) */
-	gtk_window_set_default_size(GTK_WINDOW(win_preview), 640, 480);
+	gtk_window_set_default_size(GTK_WINDOW(win_preview), 640, 400);
 	gtk_window_set_default_size(GTK_WINDOW(win_beamer), 320, 240);
+	
+	/* Hide titlebar when maximized */
+	gtk_window_set_hide_titlebar_when_maximized(GTK_WINDOW(win_preview), TRUE);
 
 	/* show the windows */
 	gtk_widget_show_all(win_preview);
@@ -1724,11 +1741,16 @@ int main(int argc, char **argv)
 	}
 
 	doc_n_pages = poppler_document_get_n_pages(doc);
+	
 	if (doc_n_pages <= 0)
 	{
 		fprintf(stderr, "Huh, no pages in that document.\n");
 		exit(EXIT_FAILURE);
 	}
+	
+	PopplerPage *page = poppler_document_get_page(doc, doc_n_pages-1);
+	doc_last_page = atoi(poppler_page_get_label(page));
+	g_object_unref(G_OBJECT(page));
 
 	initGUI(numframes, notefile);
 
